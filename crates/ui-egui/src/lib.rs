@@ -90,6 +90,9 @@ pub use workflows::ocr_verify::{OcrVerify, Phase};
 mod app;
 mod frame_guard;
 mod hooks;
+// bace: the entry points a host outside eframe drives the app through (bytes in, bytes out,
+// the revision); see host.rs.
+pub mod host;
 mod persist;
 mod platform;
 #[cfg(not(target_arch = "wasm32"))]

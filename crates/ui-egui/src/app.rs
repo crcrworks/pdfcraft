@@ -531,25 +531,11 @@ impl PdfCraftApp {
     }
 }
 
+// bace: the frame's work is inherent (below), so a host without eframe can drive it; the
+// eframe trait only delegates.
 impl eframe::App for PdfCraftApp {
-    /// While files are dragged over the window the system sends no pointer moves, so egui
-    /// would keep the place the pointer entered at: tell it where the pointer really is, so the
-    /// page grid can show (and use) the gap under it.
     fn raw_input_hook(&mut self, ctx: &egui::Context, raw: &mut egui::RawInput) {
-        // The button's release a window move or resize kept from egui.
-        window_controls::release_after_desktop_grab(ctx, raw);
-        // The wheel after Alt+Tab back, before the mouse has moved (#1518).
-        let known = ctx.input(|i| i.pointer.latest_pos().is_some());
-        let size = ctx.input(|i| i.viewport().inner_rect).map_or(egui::Vec2::ZERO, |r| r.size());
-        drag_pointer::locate_wheel(raw, known, size, || drag_pointer::in_window(ctx));
-        self.prepare_raw_input(ctx, raw);
-        if raw.hovered_files.is_empty() && raw.dropped_files.is_empty() {
-            return;
-        }
-        if let Some(pos) = drag_pointer::in_window(ctx) {
-            raw.events.push(egui::Event::PointerMoved(pos));
-        }
-        ctx.request_repaint();
+        PdfCraftApp::raw_input_hook(self, ctx, raw);
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
@@ -567,12 +553,47 @@ impl eframe::App for PdfCraftApp {
         self.updates.exiting();
     }
 
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        PdfCraftApp::logic(self, ctx);
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        PdfCraftApp::ui(self, ui);
+    }
+}
+
+impl PdfCraftApp {
+    /// While files are dragged over the window the system sends no pointer moves, so egui
+    /// would keep the place the pointer entered at: tell it where the pointer really is, so the
+    /// page grid can show (and use) the gap under it.
+    ///
+    /// A host that builds [`egui::RawInput`] itself (no eframe, as Bace does) calls this before
+    /// the pass, and then [`Self::logic`] and [`Self::ui`] inside it.
+    // bace: public for a host that builds RawInput itself (Bace calls it before logic/ui).
+    pub fn raw_input_hook(&mut self, ctx: &egui::Context, raw: &mut egui::RawInput) {
+        // The button's release a window move or resize kept from egui.
+        window_controls::release_after_desktop_grab(ctx, raw);
+        // The wheel after Alt+Tab back, before the mouse has moved (#1518).
+        let known = ctx.input(|i| i.pointer.latest_pos().is_some());
+        let size = ctx.input(|i| i.viewport().inner_rect).map_or(egui::Vec2::ZERO, |r| r.size());
+        drag_pointer::locate_wheel(raw, known, size, || drag_pointer::in_window(ctx));
+        self.prepare_raw_input(ctx, raw);
+        if raw.hovered_files.is_empty() && raw.dropped_files.is_empty() {
+            return;
+        }
+        if let Some(pos) = drag_pointer::in_window(ctx) {
+            raw.events.push(egui::Event::PointerMoved(pos));
+        }
+        ctx.request_repaint();
+    }
+
     /// Each frame's work before drawing: opens, operating-system and control-channel requests,
     /// the quit guard, shortcuts, and the background jobs' results.
     ///
     /// Last-resort guard (AGENTS.md §4, #3914): a panic in a frame is reported and the app, with
     /// every open tab, keeps running; see `frame_guard`.
-    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    // bace: public, frame-free: the eframe impl above calls it with no eframe::Frame.
+    pub fn logic(&mut self, ctx: &egui::Context) {
         self.begin_logic();
         self.guarded_frame(|app| app.logic_unguarded(ctx));
         if self.frame_panicked {
@@ -580,14 +601,14 @@ impl eframe::App for PdfCraftApp {
         }
     }
 
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    /// The frame's layout and paint, after [`Self::logic`].
+    // bace: public, frame-free, like logic.
+    pub fn ui(&mut self, ui: &mut egui::Ui) {
         self.begin_ui();
         self.guarded_frame(|app| app.ui_unguarded(ui));
         self.end_ui();
     }
-}
 
-impl PdfCraftApp {
     fn logic_unguarded(&mut self, ctx: &egui::Context) {
         #[cfg(test)]
         self.injected_panic(crate::frame_guard::FramePart::Logic);
