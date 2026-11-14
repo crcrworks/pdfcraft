@@ -568,3 +568,44 @@ mod unlinked_update_tests {
         assert!(!pdfcraft_cos::Document::open(bytes).expect("cos opens it").rebuilt_unlinked_update());
     }
 }
+
+#[cfg(test)]
+mod cancellable_open_tests {
+    use super::*;
+    use hayro::hayro_syntax::{CancellableLoadError, Cancellation, DecodeLimits};
+
+    fn tiny_pdf() -> Vec<u8> {
+        pdfcraft_testkit::Pdf::new()
+            .obj("<< /Type /Catalog /Pages 2 0 R >>")
+            .obj("<< /Type /Pages /Kids [3 0 R] /Count 1 >>")
+            .obj("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] >>")
+            .build()
+    }
+
+    /// hayro-syntax (47): a latched request answers `Cancelled`; without one the file opens as
+    /// before, and a file that cannot open keeps its `Load` error.
+    #[test]
+    fn a_cancelled_open_is_answered_and_an_ordinary_one_opens() {
+        let bytes = tiny_pdf();
+        let cancel = Cancellation::new(|| true);
+        let result = Pdf::new_with_password_limits_and_cancel(bytes.clone(), "", DecodeLimits::default(), &cancel);
+        assert!(matches!(result, Err(CancellableLoadError::Cancelled)));
+        let cancel = Cancellation::new(|| false);
+        let result = Pdf::new_with_password_limits_and_cancel(bytes, "", DecodeLimits::default(), &cancel);
+        assert!(result.is_ok());
+        let result = Pdf::new_with_password_limits_and_cancel(Vec::new(), "", DecodeLimits::default(), &cancel);
+        assert!(matches!(result, Err(CancellableLoadError::Load(LoadPdfError::Invalid))));
+    }
+
+    /// The callback is polled between the load's own steps: a request made after the entry
+    /// check is still answered with `Cancelled`.
+    #[test]
+    fn a_request_made_mid_open_is_answered() {
+        let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let p = polls.clone();
+        let cancel = Cancellation::new(move || p.fetch_add(1, std::sync::atomic::Ordering::Relaxed) > 0);
+        let result = Pdf::new_with_password_limits_and_cancel(tiny_pdf(), "", DecodeLimits::default(), &cancel);
+        assert!(matches!(result, Err(CancellableLoadError::Cancelled)));
+        assert!(polls.load(std::sync::atomic::Ordering::Relaxed) >= 2);
+    }
+}

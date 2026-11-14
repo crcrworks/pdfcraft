@@ -74,6 +74,16 @@ pub enum LoadPdfError {
     Invalid,
 }
 
+/// PdfCraft patch: (hayro-syntax (46)) failure of a cancellable open. Existing loading
+/// errors retain their original type.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum CancellableLoadError {
+    /// The caller requested cancellation while opening the document.
+    Cancelled,
+    /// The document could not be loaded.
+    Load(LoadPdfError),
+}
+
 #[allow(clippy::len_without_is_empty)]
 impl Pdf {
     /// Try to read the given PDF file.
@@ -109,7 +119,38 @@ impl Pdf {
         password: &str,
         limits: DecodeLimits,
     ) -> Result<Self, LoadPdfError> {
-        let data = data.into();
+        Self::load(data.into(), password, limits, None)
+    }
+
+    /// PdfCraft patch: (hayro-syntax (46)) open with cooperative cancellation, retaining the
+    /// existing password and decode policies, as `craft-libs`' reader states it. The callback
+    /// is owned by `cancel`, runs on this thread, and is not retained by a loaded PDF. A true
+    /// result stays latched for this open and never starts a repair pass.
+    pub fn new_with_password_limits_and_cancel(
+        data: impl Into<PdfData>,
+        password: &str,
+        limits: DecodeLimits,
+        cancel: &crate::Cancellation,
+    ) -> Result<Self, CancellableLoadError> {
+        let control = crate::cancel::Control::new(cancel);
+        let _scope = crate::cancel::Scope(control.clone());
+        if control.check().is_none() {
+            return Err(CancellableLoadError::Cancelled);
+        }
+        let result = Self::load(data.into(), password, limits, Some(control.clone()));
+        if control.check().is_none() {
+            Err(CancellableLoadError::Cancelled)
+        } else {
+            result.map_err(CancellableLoadError::Load)
+        }
+    }
+
+    fn load(
+        data: PdfData,
+        password: &str,
+        limits: DecodeLimits,
+        control: Option<crate::cancel::Control>,
+    ) -> Result<Self, LoadPdfError> {
         let password = password.as_bytes();
         let version = find_version(data.as_ref()).unwrap_or(PdfVersion::Pdf10);
         // PdfCraft patch: (hayro-syntax (43)) a last update cut off before its trailer is read by
@@ -128,10 +169,13 @@ impl Pdf {
         // PdfCraft patch: (hayro-syntax (45)) said of the file whichever table is kept, as
         // `pdfcraft-cos` says it under the same conditions.
         let rebuilt_unlinked_update = root.as_ref().is_ok_and(|(_, rebuilt)| *rebuilt);
+        // PdfCraft patch: (hayro-syntax (46)) a cancelled open never starts a repair pass.
+        crate::cancel::check(control.as_ref()).ok_or(LoadPdfError::Invalid)?;
         if cut_off_update_follows(data.as_ref())
             && let Some(xref) = fallback(data.clone(), password, limits)
                 .filter(|x| root_encrypted.is_none_or(|e| e == x.is_encrypted()))
         {
+            crate::cancel::check(control.as_ref()).ok_or(LoadPdfError::Invalid)?;
             let xref = Arc::new(xref);
             if let Some(pages) = CachedPages::new(xref.clone())
                 && !pages.get().is_empty()
@@ -149,6 +193,7 @@ impl Pdf {
             Ok((x, _)) => x,
             Err(e) => match e {
                 XRefError::Unknown => {
+                    crate::cancel::check(control.as_ref()).ok_or(LoadPdfError::Invalid)?;
                     fallback(data.clone(), password, limits).ok_or(LoadPdfError::Invalid)?
                 }
                 XRefError::Encryption(e) => return Err(LoadPdfError::Decryption(e)),
@@ -156,6 +201,7 @@ impl Pdf {
         };
         let xref = Arc::new(xref);
 
+        crate::cancel::check(control.as_ref()).ok_or(LoadPdfError::Invalid)?;
         let pages = CachedPages::new(xref.clone()).ok_or(LoadPdfError::Invalid)?;
 
         Ok(Self {
