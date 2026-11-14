@@ -33,6 +33,23 @@ pub enum MaskType {
 pub struct TransferFunction(Function);
 
 impl TransferFunction {
+    /// Craft patch (flatten): apply the transfer function to byte opacity values.
+    ///
+    /// Inputs and outputs use the same rounded 8-bit samples as the renderer. A function
+    /// that cannot evaluate a sample leaves it unchanged.
+    pub fn apply_to(&self, values: &mut [u8]) {
+        for value in values {
+            if let Some(output) = self
+                .0
+                .eval(smallvec![f32::from(*value) / 255.0])
+                .and_then(|v| v.first().copied())
+                .filter(|output| output.is_finite())
+            {
+                *value = (output.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+            }
+        }
+    }
+
     /// Apply the transfer function to the given value.
     ///
     /// The input value needs to be between 0 and 1 and the return value is

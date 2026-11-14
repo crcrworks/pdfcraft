@@ -11,6 +11,50 @@ use crate::xref::{XRef, XRefError, cut_off_update_follows, fallback, root_xref};
 pub use crate::crypto::DecryptionError;
 use crate::metadata::Metadata;
 
+/// PdfCraft patch: immutable limits for decoding one PDF's streams, as `craft-libs`' reader
+/// states them, so a host can lower what a document may inflate to without changing the
+/// default. These limits apply to ordinary stream expansion (Flate, LZW and RunLength),
+/// including object and xref streams, during initial xref parsing, repair and later reads.
+/// Known-size image pixels and incremental page content keep their separate budgets; a bare
+/// Flate page read through `Page::content_reader` is decoded incrementally under its content
+/// budget, while `Page::page_stream` materializes that same stream and does use this limit.
+/// These limits do not impose a total document memory or execution-time limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DecodeLimits {
+    max_decoded_stream: usize,
+}
+
+impl DecodeLimits {
+    /// The existing ordinary stream limit, 256 MiB.
+    pub const DEFAULT: Self = Self {
+        max_decoded_stream: crate::filter::MAX_DECODED_STREAM,
+    };
+
+    /// Lower the maximum expanded bytes per ordinary stream. Requests above the existing
+    /// 256 MiB ceiling are clamped; zero permits no ordinary materialized expansion.
+    /// This does not lower the separate incremental page-content budget.
+    pub const fn with_max_decoded_stream(self, max: usize) -> Self {
+        Self {
+            max_decoded_stream: if max < self.max_decoded_stream {
+                max
+            } else {
+                self.max_decoded_stream
+            },
+        }
+    }
+
+    /// The maximum expanded bytes per ordinary stream.
+    pub const fn max_decoded_stream(self) -> usize {
+        self.max_decoded_stream
+    }
+}
+
+impl Default for DecodeLimits {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
 /// A PDF file.
 pub struct Pdf {
     xref: Arc<XRef>,
@@ -46,6 +90,25 @@ impl Pdf {
         data: impl Into<PdfData>,
         password: &str,
     ) -> Result<Self, LoadPdfError> {
+        Self::new_with_password_and_limits(data, password, DecodeLimits::default())
+    }
+
+    /// PdfCraft patch: try to read a PDF using document-local stream expansion limits.
+    pub fn new_with_limits(
+        data: impl Into<PdfData>,
+        limits: DecodeLimits,
+    ) -> Result<Self, LoadPdfError> {
+        Self::new_with_password_and_limits(data, "", limits)
+    }
+
+    /// PdfCraft patch: try to read a PDF with a password and document-local stream expansion
+    /// limits. The same immutable limits apply during initial xref parsing, repair and later
+    /// reads.
+    pub fn new_with_password_and_limits(
+        data: impl Into<PdfData>,
+        password: &str,
+        limits: DecodeLimits,
+    ) -> Result<Self, LoadPdfError> {
         let data = data.into();
         let password = password.as_bytes();
         let version = find_version(data.as_ref()).unwrap_or(PdfVersion::Pdf10);
@@ -57,7 +120,7 @@ impl Pdf {
         // The table the last `startxref` names is read first either way: a wrong password is
         // refused through it, and the rebuilt table must be encrypted exactly when it is, so a
         // rebuild that missed the encryption dictionary is not taken.
-        let root = root_xref(data.clone(), password);
+        let root = root_xref(data.clone(), password, limits);
         if let Err(XRefError::Encryption(e)) = root {
             return Err(LoadPdfError::Decryption(e));
         }
@@ -66,7 +129,7 @@ impl Pdf {
         // `pdfcraft-cos` says it under the same conditions.
         let rebuilt_unlinked_update = root.as_ref().is_ok_and(|(_, rebuilt)| *rebuilt);
         if cut_off_update_follows(data.as_ref())
-            && let Some(xref) = fallback(data.clone(), password)
+            && let Some(xref) = fallback(data.clone(), password, limits)
                 .filter(|x| root_encrypted.is_none_or(|e| e == x.is_encrypted()))
         {
             let xref = Arc::new(xref);
@@ -86,7 +149,7 @@ impl Pdf {
             Ok((x, _)) => x,
             Err(e) => match e {
                 XRefError::Unknown => {
-                    fallback(data.clone(), password).ok_or(LoadPdfError::Invalid)?
+                    fallback(data.clone(), password, limits).ok_or(LoadPdfError::Invalid)?
                 }
                 XRefError::Encryption(e) => return Err(LoadPdfError::Decryption(e)),
             },
@@ -109,6 +172,11 @@ impl Pdf {
     /// table from the file's objects.
     pub fn rebuilt_unlinked_update(&self) -> bool {
         self.rebuilt_unlinked_update
+    }
+
+    /// PdfCraft patch: this document's immutable stream expansion limits.
+    pub fn decode_limits(&self) -> DecodeLimits {
+        self.xref.decode_limits()
     }
 
     /// Return the number of objects present in the PDF file.

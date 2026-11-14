@@ -203,6 +203,11 @@ impl<'a> Stream<'a> {
         }
     }
 
+    /// PdfCraft patch: the stream expansion limits of the document this stream was read from.
+    fn decode_limits(&self) -> crate::DecodeLimits {
+        self.dict.ctx().decode_limits()
+    }
+
     /// Return the decoded data of the stream.
     ///
     /// Note that the result of this method will not be cached, so calling it multiple
@@ -272,7 +277,9 @@ impl<'a> Stream<'a> {
                 continue;
             }
             // PdfCraft patch: see `filter::decode_limit`.
-            let limit = crate::filter::decode_limit(image_params, i + 1 == count).min(max);
+            let limit =
+                crate::filter::decode_limit(image_params, i + 1 == count, self.decode_limits())
+                    .min(max);
             // PdfCraft patch: the last filter of an image produces its rows.
             let rows = (i + 1 == count && image_params.height > 0)
                 .then(|| usize::try_from(image_params.height).ok())

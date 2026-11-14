@@ -166,17 +166,21 @@ const MAX_DECODED_IMAGE: u64 = 1 << 30;
 /// drawn. Earlier filters produce compressed data, which can be larger than the pixels, and
 /// everything else gets [`MAX_DECODED_STREAM`]. Decoding stops at the limit and keeps what it
 /// has.
-pub(crate) fn decode_limit(params: &ImageDecodeParams, last: bool) -> usize {
+pub(crate) fn decode_limit(
+    params: &ImageDecodeParams,
+    last: bool,
+    limits: crate::DecodeLimits,
+) -> usize {
     let (true, Some(bpc), Some(components)) = (last, params.bpc, params.num_components) else {
-        return MAX_DECODED_STREAM;
+        return limits.max_decoded_stream();
     };
     if params.width == 0 || params.height == 0 {
-        return MAX_DECODED_STREAM;
+        return limits.max_decoded_stream();
     }
     let bits = u64::from(params.width) * u64::from(components) * u64::from(bpc);
     let pixels = bits.div_ceil(8).saturating_mul(u64::from(params.height));
     let image = pixels.saturating_mul(2).min(MAX_DECODED_IMAGE);
-    usize::try_from(image).unwrap_or(MAX_DECODED_STREAM)
+    usize::try_from(image).unwrap_or(limits.max_decoded_stream())
 }
 
 /// PdfCraft patch: whether a CCITT image of `columns` × `rows` may be decoded. The decoder sizes

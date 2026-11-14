@@ -125,7 +125,10 @@ struct ReaderContextData<'a> {
 #[derive(Clone, Debug)]
 enum ReaderContextInner<'a> {
     Shared(Arc<ReaderContextData<'a>>),
-    Dummy { in_content_stream: bool },
+    Dummy {
+        in_content_stream: bool,
+        limits: crate::DecodeLimits,
+    },
 }
 
 /// Context for reading PDF objects.
@@ -144,14 +147,29 @@ impl<'a> ReaderContext<'a> {
     }
 
     pub fn dummy() -> Self {
+        Self::dummy_with_limits(crate::DecodeLimits::default())
+    }
+
+    /// PdfCraft patch: a dummy context that carries document-local stream expansion limits.
+    pub(crate) fn dummy_with_limits(limits: crate::DecodeLimits) -> Self {
         Self(ReaderContextInner::Dummy {
             in_content_stream: false,
+            limits,
         })
+    }
+
+    /// PdfCraft patch: the stream expansion limits in force for this context.
+    pub(crate) fn decode_limits(&self) -> crate::DecodeLimits {
+        match &self.0 {
+            ReaderContextInner::Shared(inner) => inner.xref.decode_limits(),
+            ReaderContextInner::Dummy { limits, .. } => *limits,
+        }
     }
 
     pub(crate) fn dummy_ref() -> &'static Self {
         &Self(ReaderContextInner::Dummy {
             in_content_stream: true,
+            limits: crate::DecodeLimits::DEFAULT,
         })
     }
 
@@ -167,7 +185,9 @@ impl<'a> ReaderContext<'a> {
     pub(crate) fn in_content_stream(&self) -> bool {
         match &self.0 {
             ReaderContextInner::Shared(inner) => inner.in_content_stream,
-            ReaderContextInner::Dummy { in_content_stream } => *in_content_stream,
+            ReaderContextInner::Dummy {
+                in_content_stream, ..
+            } => *in_content_stream,
         }
     }
 
@@ -199,7 +219,9 @@ impl<'a> ReaderContext<'a> {
     pub(crate) fn set_in_content_stream(&mut self, val: bool) {
         match &mut self.0 {
             ReaderContextInner::Shared(inner) => Arc::make_mut(inner).in_content_stream = val,
-            ReaderContextInner::Dummy { in_content_stream } => *in_content_stream = val,
+            ReaderContextInner::Dummy {
+                in_content_stream, ..
+            } => *in_content_stream = val,
         }
     }
 

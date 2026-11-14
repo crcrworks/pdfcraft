@@ -13,7 +13,7 @@ use crate::sync::OnceLock;
 use crate::transform::Transform;
 use crate::util::FloatExt;
 use crate::xref::XRef;
-use crate::filter::{FlateState, MAX_DECODED_STREAM};
+use crate::filter::FlateState;
 use crate::object::stream::Incremental;
 use alloc::borrow::Cow;
 use alloc::boxed::Box;
@@ -482,7 +482,7 @@ impl<'a> Page<'a> {
     /// PdfCraft patch: the content of the page, to be read a piece at a time (see
     /// [`ContentReader`]).
     pub fn content_reader(&self) -> ContentReader<'a> {
-        self.content_reader_within(MAX_DECODED_STREAM)
+        self.content_reader_within(self.inner.ctx().decode_limits().max_decoded_stream())
     }
 
     /// PdfCraft patch: [`Page::content_reader`], with `cap` in place of `MAX_DECODED_STREAM`.
@@ -513,11 +513,12 @@ impl<'a> Page<'a> {
                     convert_single(stream)
                 } else if let Some(array) = self.inner.get::<Array<'_>>(CONTENTS) {
                     let mut collected = vec![];
+                    // PdfCraft patch: the streams share the document's stream expansion limit
+                    // (an array naming one inflating stream twenty times decoded 5 GB).
+                    let cap = self.inner.ctx().decode_limits().max_decoded_stream();
 
                     for stream in array.iter::<Stream<'_>>() {
-                        // PdfCraft patch: the streams share one `MAX_DECODED_STREAM` (an array
-                        // naming one inflating stream twenty times decoded 5 GB).
-                        let left = MAX_DECODED_STREAM.saturating_sub(collected.len());
+                        let left = cap.saturating_sub(collected.len());
                         if left == 0 {
                             break;
                         }
@@ -743,6 +744,19 @@ impl<'a> Resources<'a> {
         let mut result = Self::from_parent(resources.unwrap_or_default(), parent);
         result.properties = properties;
         result
+    }
+
+    /// PdfCraft patch: use an object's entire resource dictionary, or inherit the enclosing
+    /// scope when absent, as `craft-libs`' reader names it.
+    ///
+    /// An explicit dictionary, including an empty one, replaces the enclosing resources;
+    /// missing names do not fall back individually. The enclosing reader context is retained
+    /// so indirect resources keep the document's cross-references and decode limits.
+    pub fn from_scope(resources: Option<Dict<'a>>, parent: Self) -> Self {
+        match resources {
+            Some(resources) => Self::new(resources, None, &parent.ctx),
+            None => parent,
+        }
     }
 
     /// Create a new `Resources` object.

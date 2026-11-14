@@ -16,7 +16,7 @@ use crate::object::indirect::IndirectObject;
 use crate::object::{Array, MaybeRef, ObjRef};
 use crate::object::{DateTime, Dict};
 use crate::object::{Object, ObjectLike};
-use crate::pdf::PdfVersion;
+use crate::pdf::{DecodeLimits, PdfVersion};
 use crate::reader::Reader;
 use crate::reader::{Readable, ReaderContext, ReaderExt};
 use crate::sync::{Arc, FxHashMap, Mutex, RwLock, RwLockExt};
@@ -53,17 +53,23 @@ pub(crate) enum XRefError {
 ///
 /// PdfCraft patch: (hayro-syntax (45)) also whether the table was rebuilt because the newest
 /// section cuts off the page tree (see below).
-pub(crate) fn root_xref(data: PdfData, password: &[u8]) -> Result<(XRef, bool), XRefError> {
+pub(crate) fn root_xref(
+    data: PdfData,
+    password: &[u8],
+    limits: DecodeLimits,
+) -> Result<(XRef, bool), XRefError> {
     let mut xref_map = FxHashMap::default();
     let xref_pos = find_last_xref_pos(data.as_ref()).ok_or(XRefError::Unknown)?;
-    let trailer =
-        populate_xref_impl(data.as_ref(), xref_pos, &mut xref_map).ok_or(XRefError::Unknown)?;
+    let trailer = populate_xref_impl(data.as_ref(), xref_pos, &mut xref_map, limits)
+        .ok_or(XRefError::Unknown)?;
     // PdfCraft patch: (hayro-syntax (45)) whether the newest section names an earlier one. Its
     // `/XRefStm` (a hybrid file's stream, §7.5.8.4) belongs to the same update and doesn't count,
     // as `pdfcraft-cos` doesn't count it.
     let linked = Reader::new(trailer)
-        .read_with_context::<Dict<'_>>(&ReaderContext::dummy())
-        .is_some_and(|newest| prev_offset(data.as_ref(), &newest, &XrefMap::default()).is_some());
+        .read_with_context::<Dict<'_>>(&ReaderContext::dummy_with_limits(limits))
+        .is_some_and(|newest| {
+            prev_offset(data.as_ref(), &newest, &XrefMap::default(), limits).is_some()
+        });
 
     let xref = XRef::new(
         data.clone(),
@@ -71,6 +77,7 @@ pub(crate) fn root_xref(data: PdfData, password: &[u8]) -> Result<(XRef, bool), 
         XRefInput::TrailerDictData(trailer),
         false,
         password,
+        limits,
     )?;
     // PdfCraft patch: (hayro-syntax (45)) an update whose section has no `/Prev` (ISO 32000-2
     // §7.5.6, §7.5.8.2) cuts off the revisions before it, and with them the page tree its catalog
@@ -102,14 +109,14 @@ fn more_than_one_startxref(data: &[u8]) -> bool {
 }
 
 /// Try to manually parse the PDF to build an xref table and trailer dictionary.
-pub(crate) fn fallback(data: PdfData, password: &[u8]) -> Option<XRef> {
+pub(crate) fn fallback(data: PdfData, password: &[u8], limits: DecodeLimits) -> Option<XRef> {
     warn!("xref table was invalid, trying to manually build xref table");
-    let (xref_map, xref_input) = fallback_xref_map(&data, password);
+    let (xref_map, xref_input) = fallback_xref_map(&data, password, limits);
 
     if let Some(xref_input) = xref_input {
         warn!("rebuild xref table with {} entries", xref_map.len());
 
-        XRef::new(data.clone(), xref_map, xref_input, true, password).ok()
+        XRef::new(data.clone(), xref_map, xref_input, true, password, limits).ok()
     } else {
         warn!("couldn't find trailer dictionary, failed to rebuild xref table");
 
@@ -176,8 +183,12 @@ where
     r.read_with_context::<T>(&ctx)
 }
 
-fn fallback_xref_map<'a>(data: &'a PdfData, password: &[u8]) -> (XrefMap, Option<XRefInput<'a>>) {
-    fallback_xref_map_inner(data, ReaderContext::dummy(), true, password)
+fn fallback_xref_map<'a>(
+    data: &'a PdfData,
+    password: &[u8],
+    limits: DecodeLimits,
+) -> (XrefMap, Option<XRefInput<'a>>) {
+    fallback_xref_map_inner(data, ReaderContext::dummy_with_limits(limits), true, password)
 }
 
 fn fallback_xref_map_inner<'a>(
@@ -379,6 +390,7 @@ fn fallback_xref_map_inner<'a>(
             XRefInput::TrailerDictData(trailer_dict.as_ref().map(|d| d.data()).unwrap()),
             true,
             password,
+            dummy_ctx.decode_limits(),
         ) {
             let ctx = ReaderContext::new(&xref, false);
             let (patched_map, _) = fallback_xref_map_inner(data, ctx, false, password);
@@ -448,6 +460,7 @@ impl XRef {
         input: XRefInput<'_>,
         repaired: bool,
         password: &[u8],
+        limits: DecodeLimits,
     ) -> Result<Self, XRefError> {
         // This is a bit hacky, but the problem is we can't read the resolved trailer dictionary
         // before we actually created the xref struct. So we first create it using dummy data
@@ -464,6 +477,7 @@ impl XRef {
             password: password.to_vec(),
             dict_cache: Arc::new(Mutex::new(DictCache::default())),
             object_stream_indexes: Arc::new(Mutex::new(ObjectStreamIndexes::default())),
+            limits,
         })));
 
         // We read the trailer twice, once to determine the encryption used and then a second
@@ -664,7 +678,7 @@ impl XRef {
         // Set first so an unwinding fallback cannot trigger a reparse storm.
         // Assignment below publishes a complete replacement atomically.
         locked.repaired = true;
-        let (xref_map, _) = fallback_xref_map(r.data.get(), &r.password);
+        let (xref_map, _) = fallback_xref_map(r.data.get(), &r.password, r.limits);
         locked.xref_map = xref_map;
     }
 
@@ -674,6 +688,15 @@ impl XRef {
         match &self.0 {
             Inner::Dummy => false,
             Inner::Some(r) => !matches!(r.decryptor.as_ref(), Decryptor::None),
+        }
+    }
+
+    /// PdfCraft patch: the stream expansion limits this table was built under. The dummy table
+    /// carries the defaults.
+    pub(crate) fn decode_limits(&self) -> DecodeLimits {
+        match &self.0 {
+            Inner::Dummy => DecodeLimits::DEFAULT,
+            Inner::Some(r) => r.limits,
         }
     }
 
@@ -1059,6 +1082,8 @@ struct SomeRepr {
     has_ocgs: bool,
     password: Vec<u8>,
     trailer_data: TrailerData,
+    /// PdfCraft patch: the stream expansion limits the table was built under.
+    limits: DecodeLimits,
 }
 
 #[derive(Debug, Clone)]
@@ -1107,9 +1132,14 @@ impl XRefEntry {
     }
 }
 
-fn populate_xref_impl<'a>(data: &'a [u8], pos: usize, xref_map: &mut XrefMap) -> Option<&'a [u8]> {
+fn populate_xref_impl<'a>(
+    data: &'a [u8],
+    pos: usize,
+    xref_map: &mut XrefMap,
+    limits: DecodeLimits,
+) -> Option<&'a [u8]> {
     let mut visited = BTreeSet::new();
-    populate_xref_impl_inner(data, pos, xref_map, &mut visited)
+    populate_xref_impl_inner(data, pos, xref_map, &mut visited, limits)
 }
 
 /// The offset of the previous xref section (`Prev`).
@@ -1117,7 +1147,12 @@ fn populate_xref_impl<'a>(data: &'a [u8], pos: usize, xref_map: &mut XrefMap) ->
 // own entries (`own`) place that object and it holds an offset (iText's `indirectPrev.pdf`), that
 // is the offset; otherwise its object number is (tiff2pdf, in JHOVE's PDF-HUL-157 files), as
 // `pdfcraft-cos` and other readers take it.
-fn prev_offset(data: &[u8], trailer: &Dict<'_>, own: &XrefMap) -> Option<usize> {
+fn prev_offset(
+    data: &[u8],
+    trailer: &Dict<'_>,
+    own: &XrefMap,
+    limits: DecodeLimits,
+) -> Option<usize> {
     if let Some(prev) = trailer.get::<i32>(PREV) {
         return usize::try_from(prev).ok();
     }
@@ -1129,7 +1164,7 @@ fn prev_offset(data: &[u8], trailer: &Dict<'_>, own: &XrefMap) -> Option<usize> 
             let mut reader = Reader::new(data);
             reader.jump(*at);
             reader
-                .read_with_context::<IndirectObject<i32>>(&ReaderContext::dummy())
+                .read_with_context::<IndirectObject<i32>>(&ReaderContext::dummy_with_limits(limits))
                 .filter(|o| o.id() == &id)
                 .map(|o| o.get())
                 .filter(|p| *p >= 0)
@@ -1148,6 +1183,7 @@ fn populate_xref_impl_inner<'a>(
     pos: usize,
     xref_map: &mut XrefMap,
     visited: &mut BTreeSet<usize>,
+    limits: DecodeLimits,
 ) -> Option<&'a [u8]> {
     if !visited.insert(pos) {
         warn!("circular xref PREV chain detected at offset {}", pos);
@@ -1175,9 +1211,9 @@ fn populate_xref_impl_inner<'a>(
         .read_without_context::<ObjectIdentifier>()
         .is_some()
     {
-        populate_from_xref_stream(data, &mut r2, xref_map, visited)
+        populate_from_xref_stream(data, &mut r2, xref_map, visited, limits)
     } else {
-        populate_from_xref_table(data, &mut r2, xref_map, visited)
+        populate_from_xref_table(data, &mut r2, xref_map, visited, limits)
     }
 }
 
@@ -1204,10 +1240,11 @@ fn populate_from_xref_table<'a>(
     reader: &mut Reader<'a>,
     insert_map: &mut XrefMap,
     visited: &mut BTreeSet<usize>,
+    limits: DecodeLimits,
 ) -> Option<&'a [u8]> {
     let trailer = {
         let mut reader = reader.clone();
-        read_xref_table_trailer(&mut reader, &ReaderContext::dummy())?
+        read_xref_table_trailer(&mut reader, &ReaderContext::dummy_with_limits(limits))?
     };
 
     reader.skip_white_spaces();
@@ -1240,15 +1277,15 @@ fn populate_from_xref_table<'a>(
         }
     }
 
-    if let Some(prev) = prev_offset(data, &trailer, &own) {
+    if let Some(prev) = prev_offset(data, &trailer, &own, limits) {
         // First insert the entries from any previous xref tables.
-        populate_xref_impl_inner(data, prev, insert_map, visited)?;
+        populate_xref_impl_inner(data, prev, insert_map, visited, limits)?;
     }
 
     // In hybrid files, entries in `XRefStm` should have higher priority, therefore we insert them
     // after looking at `PREV`.
     if let Some(xref_stm) = trailer.get::<i32>(XREF_STM) {
-        populate_xref_impl_inner(data, xref_stm as usize, insert_map, visited)?;
+        populate_xref_impl_inner(data, xref_stm as usize, insert_map, visited, limits)?;
     }
 
     insert_map.extend(own);
@@ -1261,9 +1298,10 @@ fn populate_from_xref_stream<'a>(
     reader: &mut Reader<'a>,
     insert_map: &mut XrefMap,
     visited: &mut BTreeSet<usize>,
+    limits: DecodeLimits,
 ) -> Option<&'a [u8]> {
     let stream = reader
-        .read_with_context::<IndirectObject<Stream<'_>>>(&ReaderContext::dummy())?
+        .read_with_context::<IndirectObject<Stream<'_>>>(&ReaderContext::dummy_with_limits(limits))?
         .get();
 
     let size = stream.dict().get::<u32>(SIZE)?;
@@ -1300,9 +1338,9 @@ fn populate_from_xref_stream<'a>(
         xref_stream_subsection(&mut xref_reader, 0, size, f1_len, f2_len, f3_len, &mut own)?;
     }
 
-    if let Some(prev) = prev_offset(data, stream.dict(), &own) {
+    if let Some(prev) = prev_offset(data, stream.dict(), &own, limits) {
         // First insert the entries from any previous xref tables.
-        let _ = populate_xref_impl_inner(data, prev, insert_map, visited)?;
+        let _ = populate_xref_impl_inner(data, prev, insert_map, visited, limits)?;
     }
 
     insert_map.extend(own);

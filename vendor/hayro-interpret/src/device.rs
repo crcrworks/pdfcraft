@@ -108,6 +108,9 @@ pub trait Device<'a> {
     fn begin_knockout_erase(&mut self) {}
     /// PdfCraft patch (39): see `knockout_erase_wanted`.
     fn end_knockout_erase(&mut self) {}
+    /// Craft patch (flatten): the transparency group just pushed is isolated (`/I true`), until
+    /// the matching `pop_transparency_group`.
+    fn set_isolated(&mut self) {}
     /// PdfCraft patch (67): the knockout group just pushed (`set_knockout`) is drawn once per
     /// blend mode its elements use, each pass into a layer of its own composited with that
     /// mode. In this pass only elements whose blend mode is `mode` paint; every other element
