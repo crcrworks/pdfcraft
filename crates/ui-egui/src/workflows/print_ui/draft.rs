@@ -570,6 +570,9 @@ impl PrintDraft {
             // A user's custom label is not a keyword from the driver's media catalog.
             .chain(Some(print::paper_media_option((!self.paper_is_custom()).then(|| self.paper_name()).as_deref(), self.paper_size())))
             .collect(),
+            // The driver's own dialog (Windows `DocumentProperties`) is not wired into this
+            // draft; a job carries no settings chosen there.
+            driver_settings: None,
         }
     }
 }
